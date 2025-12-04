@@ -81,12 +81,16 @@ class FTPClientGUI:
 
         self.btn_mkdir = ttk.Button(frm_path, text="New Folder", command=self.mkdir)
         self.btn_mkdir.grid(row=0, column=3, padx=2)
+        self.btn_newfile = ttk.Button(frm_path, text="New File", command=self.new_file)
+        self.btn_newfile.grid(row=0, column=4, padx=2)
+        self.btn_upload = ttk.Button(frm_path, text="Upload", command=self.upload)
+        self.btn_upload.grid(row=0, column=5, padx=2)
         self.btn_rename = ttk.Button(frm_path, text="Rename", command=self.rename)
-        self.btn_rename.grid(row=0, column=4, padx=2)
+        self.btn_rename.grid(row=0, column=6, padx=2)
         self.btn_delete = ttk.Button(frm_path, text="Delete", command=self.delete)
-        self.btn_delete.grid(row=0, column=5, padx=2)
+        self.btn_delete.grid(row=0, column=7, padx=2)
         self.btn_download = ttk.Button(frm_path, text="Download", command=self.download)
-        self.btn_download.grid(row=0, column=6, padx=2)
+        self.btn_download.grid(row=0, column=8, padx=2)
 
         # File list
         frm_list = ttk.Frame(self.master)
@@ -170,6 +174,8 @@ class FTPClientGUI:
         self.btn_disconnect.configure(state="normal")
         self.btn_up.configure(state="normal")
         self.btn_mkdir.configure(state="normal")
+        self.btn_newfile.configure(state="normal")
+        self.btn_upload.configure(state="normal")
         self.btn_rename.configure(state="normal")
         self.btn_delete.configure(state="normal")
         self.btn_download.configure(state="normal")
@@ -180,6 +186,8 @@ class FTPClientGUI:
         self.btn_disconnect.configure(state="disabled")
         self.btn_up.configure(state="disabled")
         self.btn_mkdir.configure(state="disabled")
+        self.btn_newfile.configure(state="disabled")
+        self.btn_upload.configure(state="disabled")
         self.btn_rename.configure(state="disabled")
         self.btn_delete.configure(state="disabled")
         self.btn_download.configure(state="disabled")
@@ -201,52 +209,60 @@ class FTPClientGUI:
         ftp = self.ftp
         assert ftp is not None
 
+        # Clear current tree
         for item in self.tree.get_children():
             self.tree.delete(item)
 
+        # Update path label
         self.current_path = ftp.pwd()
         self.lbl_path.configure(text=self.current_path)
 
         entries: list[tuple[str, str, int | None]] = []  # (name, type, size)
 
-        def parse_line(line: str) -> None:
-            # Typical UNIX-like LIST output: drwxr-xr-x 1 owner group 0 Jan 01 00:00 dirname
-            parts = line.split(maxsplit=8)
-            if len(parts) < 9:
-                return
-            meta, _, _, _, size, _, _, _, name = parts
-            ftype = "dir" if meta.startswith("d") else "file"
-            try:
-                size_int: int | None = int(size) if ftype == "file" else None
-            except ValueError:
-                size_int = None
-            entries.append((name, ftype, size_int))
-
-        # Wrapper to safely decode raw bytes from FTP LIST with fallback encodings
-        def _raw_line_handler(raw: bytes) -> None:
-            # Try a few common encodings; ignore undecodable chars
-            for enc in ("utf-8", "gbk", "latin-1"):
-                try:
-                    text = raw.decode(enc, errors="ignore")
-                    break
-                except Exception:
-                    continue
-            else:
-                # As a very last resort, use repr
-                text = repr(raw)
-            parse_line(text.rstrip("\r\n"))
-
         try:
-            # Use retrlines with callback that accepts raw bytes; ftplib will
-            # pass us bytes on some servers / Python versions.
-            ftp.retrlines("LIST", callback=_raw_line_handler)
-        except TypeError:
-            # Fallback for environments where retrlines already decodes to str
+            # Prefer MLSD: structured directory listing if server supports it
             try:
-                ftp.retrlines("LIST", callback=parse_line)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to list directory: {e}")
-                return
+                for name, facts in ftp.mlsd():
+                    if name in (".", ".."):
+                        continue
+                    ftype = facts.get("type", "file")
+                    if ftype == "dir":
+                        entries.append((name, "dir", None))
+                    else:
+                        size_str = facts.get("size")
+                        size_int: int | None = int(size_str) if size_str is not None else None
+                        entries.append((name, "file", size_int))
+            except Exception:
+                # Fallback: NLST returns only names
+                names = ftp.nlst()
+                for name in names:
+                    if name in (".", ".."):
+                        continue
+
+                    # Detect directory by trying cwd
+                    is_dir = False
+                    cur = ftp.pwd()
+                    try:
+                        ftp.cwd(name)
+                        is_dir = True
+                    except Exception:
+                        is_dir = False
+                    finally:
+                        try:
+                            ftp.cwd(cur)
+                        except Exception:
+                            pass
+
+                    if is_dir:
+                        entries.append((name, "dir", None))
+                    else:
+                        size: int | None = None
+                        try:
+                            size_val = ftp.size(name)
+                            size = int(size_val) if size_val is not None else None
+                        except Exception:
+                            size = None
+                        entries.append((name, "file", size))
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list directory: {e}")
             return
@@ -299,6 +315,51 @@ class FTPClientGUI:
             return None
         name, _size, ftype = values
         return name, ftype
+
+    def new_file(self) -> None:
+        """Create a small text file on the server using STOR with in-memory data."""
+        if not self._ensure_connected():
+            return
+        filename = simpledialog.askstring("New file", "File name:", parent=self.master)
+        if not filename:
+            return
+        content = simpledialog.askstring("New file", "Initial content (optional):", parent=self.master)
+        if content is None:
+            content = ""
+        data = content.encode("utf-8")
+        ftp = self.ftp
+        assert ftp is not None
+        from io import BytesIO
+        try:
+            bio = BytesIO(data)
+            ftp.storbinary(f"STOR {filename}", bio)
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create file: {e}")
+
+    def upload(self) -> None:
+        """Upload a local file to the current remote directory."""
+        if not self._ensure_connected():
+            return
+        local_path = filedialog.askopenfilename(title="Select file to upload")
+        if not local_path:
+            return
+        filename = os.path.basename(local_path)
+        ftp = self.ftp
+        assert ftp is not None
+
+        def _do_upload():
+            self._set_status(f"Uploading {filename} ...")
+            try:
+                with open(local_path, "rb") as f:
+                    ftp.storbinary(f"STOR {filename}", f)
+                self._set_status(f"Uploaded {filename}")
+                self._refresh_list()
+            except Exception as e:
+                self._set_status("Upload failed")
+                messagebox.showerror("Error", f"Failed to upload file: {e}")
+
+        threading.Thread(target=_do_upload, daemon=True).start()
 
     def mkdir(self) -> None:
         if not self._ensure_connected():
