@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Simple GUI FTP client based on TCP/IP sockets.
+"""Simple GUI FTP client (FileZilla-like) using our raw-socket FTP library.
 
-Features:
-- Connect to FTP server with host, port, username, password
-- List remote directory
-- Download files
-- Create / delete / rename files and directories
-
-This uses Python's built-in ftplib which implements the FTP protocol
-on top of TCP sockets.
+The actual FTP protocol implementation lives in simple_ftp.FTPConnection.
+This file only contains the Tkinter GUI and high-level user interactions.
 """
 
 import os
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from ftplib import FTP, error_perm
+from typing import List, Optional, Tuple
+
+from simple_ftp import FTPConnection, FTPProtocolError
 
 
 class FTPClientGUI:
     def __init__(self, master: tk.Tk) -> None:
         self.master = master
-        self.master.title("Simple FTP Client")
+        self.master.title("Simple FTP Client (Raw Socket)")
         self.master.geometry("900x500")
 
-        self.ftp: FTP | None = None
+        self.ftp: Optional[FTPConnection] = None
         self.current_path = "/"
 
         self._build_widgets()
@@ -138,9 +134,9 @@ class FTPClientGUI:
         def _do_connect():
             self._set_status(f"Connecting to {host}:{port} ...")
             try:
-                ftp = FTP()
+                ftp = FTPConnection()
                 ftp.connect(host, port, timeout=10)
-                ftp.login(user=user, passwd=password)
+                ftp.login(user=user, password=password)
                 self.ftp = ftp
                 self.current_path = ftp.pwd()
                 self._set_connected_state()
@@ -209,65 +205,37 @@ class FTPClientGUI:
         ftp = self.ftp
         assert ftp is not None
 
-        # Clear current tree
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # Update path label
-        self.current_path = ftp.pwd()
+        try:
+            self.current_path = ftp.pwd()
+        except Exception:
+            pass
         self.lbl_path.configure(text=self.current_path)
 
-        entries: list[tuple[str, str, int | None]] = []  # (name, type, size)
+        entries: List[Tuple[str, str, Optional[int]]] = []  # (name, type, size)
 
         try:
-            # Prefer MLSD: structured directory listing if server supports it
-            try:
-                for name, facts in ftp.mlsd():
-                    if name in (".", ".."):
-                        continue
-                    ftype = facts.get("type", "file")
-                    if ftype == "dir":
-                        entries.append((name, "dir", None))
-                    else:
-                        size_str = facts.get("size")
-                        size_int: int | None = int(size_str) if size_str is not None else None
-                        entries.append((name, "file", size_int))
-            except Exception:
-                # Fallback: NLST returns only names
-                names = ftp.nlst()
-                for name in names:
-                    if name in (".", ".."):
-                        continue
-
-                    # Detect directory by trying cwd
-                    is_dir = False
-                    cur = ftp.pwd()
-                    try:
-                        ftp.cwd(name)
-                        is_dir = True
-                    except Exception:
-                        is_dir = False
-                    finally:
-                        try:
-                            ftp.cwd(cur)
-                        except Exception:
-                            pass
-
-                    if is_dir:
-                        entries.append((name, "dir", None))
-                    else:
-                        size: int | None = None
-                        try:
-                            size_val = ftp.size(name)
-                            size = int(size_val) if size_val is not None else None
-                        except Exception:
-                            size = None
-                        entries.append((name, "file", size))
+            lines = ftp.list_lines()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list directory: {e}")
             return
 
-        # Sort: directories first, then files, by name
+        for line in lines:
+            parts = line.split(maxsplit=8)
+            if len(parts) < 9:
+                name = line.strip()
+                entries.append((name, "file", None))
+                continue
+            meta, _links, _owner, _group, size, _mon, _day, _time_year, name = parts
+            ftype = "dir" if meta.startswith("d") else "file"
+            try:
+                size_int: Optional[int] = int(size) if ftype == "file" else None
+            except ValueError:
+                size_int = None
+            entries.append((name, ftype, size_int))
+
         entries.sort(key=lambda x: (0 if x[1] == "dir" else 1, x[0].lower()))
 
         for name, ftype, size in entries:
@@ -332,13 +300,13 @@ class FTPClientGUI:
         from io import BytesIO
         try:
             bio = BytesIO(data)
-            ftp.storbinary(f"STOR {filename}", bio)
+            ftp.stor_binary(filename, bio)
             self._refresh_list()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create file: {e}")
 
     def upload(self) -> None:
-        """Upload a local file to the current remote directory."""
+        """Upload a local file to the current remote directory using STOR."""
         if not self._ensure_connected():
             return
         local_path = filedialog.askopenfilename(title="Select file to upload")
@@ -352,7 +320,7 @@ class FTPClientGUI:
             self._set_status(f"Uploading {filename} ...")
             try:
                 with open(local_path, "rb") as f:
-                    ftp.storbinary(f"STOR {filename}", f)
+                    ftp.stor_binary(filename, f)
                 self._set_status(f"Uploaded {filename}")
                 self._refresh_list()
             except Exception as e:
@@ -412,8 +380,6 @@ class FTPClientGUI:
             else:
                 ftp.delete(name)
             self._refresh_list()
-        except error_perm as e:
-            messagebox.showerror("Error", f"Permission error: {e}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete: {e}")
 
@@ -440,7 +406,7 @@ class FTPClientGUI:
             self._set_status(f"Downloading {name} ...")
             try:
                 with open(local_path, "wb") as f:
-                    ftp.retrbinary(f"RETR {name}", f.write)
+                    ftp.retr_binary(name, f.write)
                 self._set_status(f"Downloaded {name} to {local_path}")
             except Exception as e:
                 self._set_status("Download failed")
