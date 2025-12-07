@@ -1,2 +1,4 @@
 /documents
 /ftp_root/*
+/__pycache__/
+/source/__pycache__/
