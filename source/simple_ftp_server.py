@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import socket
 import threading
+import traceback
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 
@@ -182,11 +183,25 @@ class FTPSession:
         host = self.config.host if self.config.host != "0.0.0.0" else self.conn.getsockname()[0]
         self.pasv_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.pasv_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.pasv_listener.bind((host, 0))
+        try:
+            self.pasv_listener.bind((host, 0))
+        except Exception as e:
+            print(f"[PASV] bind error on {host}: {e}")
+            traceback.print_exc()
+            self.reply(421, "Cannot open passive listener")
+            return
         self.pasv_listener.listen(1)
 
-        h1, h2, h3, h4 = host.split(".")
+        # Debug output
         port = self.pasv_listener.getsockname()[1]
+        print(f"[PASV] listening on {host}:{port}")
+
+        try:
+            h1, h2, h3, h4 = host.split(".")
+        except Exception:
+            # fallback to control socket address
+            host = self.conn.getsockname()[0]
+            h1, h2, h3, h4 = host.split(".")
         p1 = port // 256
         p2 = port % 256
         self.reply(227, f"Entering Passive Mode ({h1},{h2},{h3},{h4},{p1},{p2}).")
@@ -196,9 +211,13 @@ class FTPSession:
             self.reply(425, "Use PASV first.")
             return None
         try:
-            data_conn, _ = self.pasv_listener.accept()
+            print("[PASV] waiting for data connection...")
+            data_conn, peer = self.pasv_listener.accept()
+            print(f"[PASV] data connection accepted from {peer}")
             return data_conn
-        except Exception:
+        except Exception as e:
+            print(f"[PASV] accept failed: {e}")
+            traceback.print_exc()
             self.reply(425, "Can't open data connection.")
             return None
         finally:
@@ -221,7 +240,9 @@ class FTPSession:
         real_dir = self.to_real_path(arg or self.cwd)
         try:
             entries = os.listdir(real_dir)
-        except Exception:
+        except Exception as e:
+            print(f"[LIST] os.listdir error for {real_dir}: {e}")
+            traceback.print_exc()
             entries = []
 
         with data_conn:
@@ -234,9 +255,16 @@ class FTPSession:
                         line = f"drwxr-xr-x 1 owner group 0 Jan 01 00:00 {name}\r\n"
                     else:
                         line = f"-rw-r--r-- 1 owner group {size} Jan 01 00:00 {name}\r\n"
-                except Exception:
+                except Exception as e:
+                    print(f"[LIST] stat error for {full}: {e}")
+                    traceback.print_exc()
                     line = f"-rw-r--r-- 1 owner group 0 Jan 01 00:00 {name}\r\n"
-                data_conn.sendall(line.encode("utf-8"))
+                try:
+                    data_conn.sendall(line.encode("utf-8"))
+                except Exception as e:
+                    print(f"[LIST] sendall error: {e}")
+                    traceback.print_exc()
+                    break
 
         self.reply(226, "Directory send OK.")
 
@@ -256,6 +284,7 @@ class FTPSession:
 
         self.reply(150, "Opening binary mode data connection.")
         try:
+            print(f"[RETR] sending file {real_path}")
             with data_conn, open(real_path, "rb") as f:
                 while True:
                     buf = f.read(4096)
@@ -263,7 +292,9 @@ class FTPSession:
                         break
                     data_conn.sendall(buf)
             self.reply(226, "Transfer complete.")
-        except Exception:
+        except Exception as e:
+            print(f"[RETR] error transferring {real_path}: {e}")
+            traceback.print_exc()
             self.reply(550, "Failed to read file.")
 
     # ---- STOR ----
@@ -282,6 +313,8 @@ class FTPSession:
 
         self.reply(150, "Opening binary mode data connection for file upload.")
         try:
+            print(f"[STOR] receiving file -> {real_path}")
+            print(f"[STOR] write access to dir? {os.access(os.path.dirname(real_path), os.W_OK)}")
             with data_conn, open(real_path, "wb") as f:
                 while True:
                     buf = data_conn.recv(4096)
@@ -289,7 +322,9 @@ class FTPSession:
                         break
                     f.write(buf)
             self.reply(226, "Transfer complete.")
-        except Exception:
+        except Exception as e:
+            print(f"[STOR] error storing {real_path}: {e}")
+            traceback.print_exc()
             self.reply(550, "Failed to store file.")
 
     # ---- MKD / RMD / DELE / RNFR / RNTO ----
